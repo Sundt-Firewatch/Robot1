@@ -1,1 +1,102 @@
-## This is the main file for the Sundt Firewatch Robot Prototype 
+#!/usr/bin/env python3
+"""
+firewatch.py – Minimal RGB‑only fire‑watch prototype
+---------------------------------------------------
+This super‑lean version ignores the LTE dongle and MQTT cloud alerts. It
+simply watches the Raspberry Pi Camera Module 3 for flame‑coloured pixels
+and drives a 120 dB siren/strobe (via a MOSFET or relay on GPIO 18) when
+fire is detected.
+
+Dependencies (install inside your virtual‑env):
+    sudo apt install -y python3-picamera2 python3-opencv gpiozero
+
+Systemd: copy the service block at the bottom of this file to
+/etc/systemd/system/firewatch.service then enable it with
+    sudo systemctl enable --now firewatch
+"""
+from __future__ import annotations
+
+import time
+from typing import Tuple
+
+import cv2
+import numpy as np
+from gpiozero import LED
+from picamera2 import Picamera2
+
+# ---------------------- user‑configurable constants ---------------------- #
+SIREN_PIN: int = 18           # GPIO BCM pin that drives the MOSFET/relay
+SIREN_DURATION: int = 10      # seconds the siren stays on per alarm
+PIXEL_THRESHOLD: int = 500    # min # HSV‑mask pixels to count as fire
+FRAME_SIZE: Tuple[int, int] = (640, 480)  # resolution to process (w, h)
+COOLDOWN: int = SIREN_DURATION + 5        # seconds before next alarm
+
+# HSV bounds for typical yellow/orange flame pixels (tweak for environment)
+HSV_LOWER = (0, 50, 200)   # hue 0–35 covers reds → oranges
+HSV_UPPER = (35, 255, 255)
+
+# ----------------------------- helpers ---------------------------------- #
+
+def is_flame(frame_bgr: np.ndarray) -> bool:
+    """Return True if flame‑coloured area exceeds PIXEL_THRESHOLD pixels."""
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, HSV_LOWER, HSV_UPPER)
+    return int(cv2.countNonZero(mask)) > PIXEL_THRESHOLD
+
+# -------------------------- main routine -------------------------------- #
+
+def main() -> None:
+    print("[firewatch] starting – RGB‑only mode …")
+
+    # Initialise siren GPIO (low = off)
+    siren = LED(SIREN_PIN)
+    siren.off()
+
+    # Initialise camera
+    cam = Picamera2()
+    cam.configure(
+        cam.create_video_configuration(main={"size": FRAME_SIZE, "format": "BGR888"})
+    )
+    cam.start()
+
+    last_alarm = 0.0  # epoch time of last alarm
+
+    try:
+        while True:
+            frame = cam.capture_array("main")  # numpy BGR888
+            if is_flame(frame):
+                now = time.time()
+                if now - last_alarm > COOLDOWN:
+                    print("[firewatch] 🔥 Fire detected – sounding siren")
+                    siren.on()
+                    time.sleep(SIREN_DURATION)
+                    siren.off()
+                    last_alarm = time.time()
+            time.sleep(0.25)  # ~4 FPS processing rate
+    except KeyboardInterrupt:
+        print("[firewatch] shutting down via Ctrl‑C …")
+    finally:
+        siren.off()
+        cam.stop()
+
+
+if __name__ == "__main__":
+    main()
+
+# -------------------------- systemd helper ------------------------------ #
+# Save the block below as /etc/systemd/system/firewatch.service then run:
+#   sudo systemctl enable --now firewatch
+# ----------------------------------------------------------------------- #
+# [Unit]
+# Description=Fire‑Watch Robot (RGB‑only, local siren)
+# After=network.target
+#
+# [Service]
+# User=pi
+# WorkingDirectory=/home/pi/firewatch
+# ExecStart=/home/pi/firewatch/bin/python /home/pi/firewatch/firewatch.py
+# Restart=on-failure
+# Environment=PYTHONUNBUFFERED=1
+#
+# [Install]
+# WantedBy=multi-user.target
