@@ -1,91 +1,116 @@
 #!/usr/bin/env python3
 """
-firewatch.py – Minimal RGB‑only fire‑watch prototype (console alert only)
-------------------------------------------------------------------------
-This version strips out **all GPIO, siren, LTE, and MQTT code**. It simply
-watches the Raspberry Pi Camera Module 3 for flame‑coloured pixels and
-prints **"Alert – Fire Detected!"** to the console whenever an alarm
-condition is met. Use this to verify your camera + OpenCV pipeline before
-wiring any hardware.
+firewatch.py – RGB Fire‑watch with YOLO & Live Preview
+-----------------------------------------------------
+This version upgrades the previous HSV prototype to use a **YOLO object‑
+detection model** (e.g. a custom‑trained YOLOv5/YOLOv8 weight) to spot
+flames. It also opens a live OpenCV window so you can see the camera
+feed with bounding‑boxes around any detected fire.
 
-Dependencies (install inside your virtual‑env):
+When YOLO flags a "fire" object above the confidence threshold the
+script prints **"Alert – Fire Detected!"** in the terminal. (Re‑add the
+GPIO siren or MQTT code later once you’re happy with accuracy.)
+
+*Works well on a Raspberry Pi 4/5 at ~5 FPS with a tiny YOLO model such
+as `yolov5n` or a custom "fire‑only" weight.*
+
+Dependencies (install in venv):
     sudo apt install -y python3-picamera2 python3-opencv
+    # Pi‑wheels gives fast ARM wheels for torch & ultralytics
+    python -m pip install --no-cache-dir torch torchvision torchaudio \
+        --index-url https://www.piwheels.org/simple
+    python -m pip install ultralytics
 
-Systemd: copy the service block at the bottom of this file to
-/etc/systemd/system/firewatch.service then enable it with
-    sudo systemctl enable --now firewatch
+Download / train a YOLO weight (fire‑only) and point YOLO_WEIGHTS at it.
+Examples on GitHub: spacewalk01/yolov5-fire-detection, JYe9/yolov5-fire-
+detection, TommyNgx/YOLOv10-Fire-and-Smoke-Detection.
+
+Systemd: copy the service block at the bottom into /etc/systemd/system /
+firewatch.service and enable it when ready.
 """
 from __future__ import annotations
 
 import time
+from pathlib import Path
 from typing import Tuple
 
 import cv2
 import numpy as np
 from picamera2 import Picamera2
+from ultralytics import YOLO  # type: ignore
 
-# ---------------------- user‑configurable constants ---------------------- #
-PIXEL_THRESHOLD: int = 500    # min # HSV‑mask pixels to count as fire
-FRAME_SIZE: Tuple[int, int] = (640, 480)  # resolution to process (w, h)
-COOLDOWN: int = 15            # seconds before another alert prints
+# ----------------------------- constants -------------------------------- #
+YOLO_WEIGHTS = Path("fire_yolov5n.pt")      # <- supply your own weight file
+CONF_THRESHOLD = 0.4                         # detection confidence
+FRAME_SIZE: Tuple[int, int] = (640, 480)     # width, height for inference
+COOLDOWN = 15                                # seconds between alerts
 
-# HSV bounds for typical yellow/orange flame pixels (tweak for environment)
-HSV_LOWER = (0, 50, 200)   # hue 0–35 covers reds → oranges
-HSV_UPPER = (35, 255, 255)
+# ------------------------- initialisation -------------------------------- #
+print("[firewatch] loading YOLO model …")
+model = YOLO(str(YOLO_WEIGHTS))
+print("[firewatch] model loaded (classes:", model.names, ")")
 
-# ----------------------------- helpers ---------------------------------- #
+cam = Picamera2()
+cam.configure(cam.create_video_configuration(
+    main={"size": FRAME_SIZE, "format": "BGR888"}))
+cam.start()
 
-def is_flame(frame_bgr: np.ndarray) -> bool:
-    """Return True if flame‑coloured area exceeds PIXEL_THRESHOLD pixels."""
-    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(hsv, HSV_LOWER, HSV_UPPER)
-    return int(cv2.countNonZero(mask)) > PIXEL_THRESHOLD
+last_alert = 0.0
 
-# -------------------------- main routine -------------------------------- #
+# OpenCV window setup
+cv2.namedWindow("Fire‑Watch", cv2.WINDOW_NORMAL)
+cv2.resizeWindow("Fire‑Watch", 960, 720)
 
-def main() -> None:
-    print("[firewatch] starting – RGB‑only console mode …")
+print("[firewatch] running – press 'q' to quit …")
 
-    cam = Picamera2()
-    cam.configure(
-        cam.create_video_configuration(main={"size": FRAME_SIZE, "format": "BGR888"})
-    )
-    cam.start()
+# ----------------------------- main loop --------------------------------- #
+try:
+    while True:
+        frame_bgr = cam.capture_array("main")
 
-    last_alert = 0.0  # epoch time of last alert
+        # Ultralytics expects RGB numpy
+        results = model(frame_bgr[..., ::-1], verbose=False)
+        fire_found = False
 
-    try:
-        while True:
-            frame = cam.capture_array("main")  # numpy BGR888
-            if is_flame(frame):
-                now = time.time()
-                if now - last_alert > COOLDOWN:
-                    print("Alert – Fire Detected!")
-                    last_alert = now
-            time.sleep(0.25)  # ~4 FPS processing rate
-    except KeyboardInterrupt:
-        print("[firewatch] shutting down via Ctrl‑C …")
-    finally:
-        cam.stop()
+        for r in results:
+            for box, cls, conf in zip(r.boxes.xyxy, r.boxes.cls, r.boxes.conf):
+                if conf < CONF_THRESHOLD:
+                    continue
+                class_name = model.names[int(cls)]
+                if class_name.lower() != "fire":
+                    continue
+                fire_found = True
+                x1, y1, x2, y2 = map(int, box)
+                cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), (0, 0, 255), 2)
+                label = f"{class_name} {conf:.2f}"
+                cv2.putText(frame_bgr, label, (x1, y1 - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
 
+        if fire_found and time.time() - last_alert > COOLDOWN:
+            print("Alert – Fire Detected!")
+            last_alert = time.time()
 
-if __name__ == "__main__":
-    main()
+        cv2.imshow("Fire‑Watch", frame_bgr)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
 
-# -------------------------- systemd helper ------------------------------ #
-# Save the block below as /etc/systemd/system/firewatch.service then run:
-#   sudo systemctl enable --now firewatch
-# ----------------------------------------------------------------------- #
+except KeyboardInterrupt:
+    print("[firewatch] Ctrl‑C detected – exiting …")
+finally:
+    cam.stop()
+    cv2.destroyAllWindows()
+
+# ----------------------- systemd (optional) ------------------------------ #
 # [Unit]
-# Description=Fire‑Watch Robot (RGB‑only, console alert)
+# Description=Fire‑Watch Robot (YOLO, preview)
 # After=network.target
-#
+# 
 # [Service]
 # User=pi
 # WorkingDirectory=/home/pi/firewatch
 # ExecStart=/home/pi/firewatch/bin/python /home/pi/firewatch/firewatch.py
 # Restart=on-failure
 # Environment=PYTHONUNBUFFERED=1
-#
+# 
 # [Install]
 # WantedBy=multi-user.target
